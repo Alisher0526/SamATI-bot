@@ -761,7 +761,7 @@ def build_app():
     app.add_handler(CallbackQueryHandler(menu_cb))
 
     # ignore other texts
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, lambda u, c: None))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, noop))
 
     # jobs
     app.job_queue.run_repeating(job_auto_sync, interval=60 * 60, first=30)
