@@ -763,9 +763,6 @@ def build_app():
     # ignore other texts
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, noop))
 
-    # jobs
-    app.job_queue.run_repeating(job_auto_sync, interval=60 * 60, first=30)
-
     return app
 
 
