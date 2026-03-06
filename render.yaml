@@ -1,8 +1,12 @@
 services:
-  - type: web
-    name: samati-bot
-    runtime: python
+  - type: worker
+    name: samati-pro-bot
+    env: python
     plan: free
-    buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:flask_app
-    autoDeploy: true
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python main.py"
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
