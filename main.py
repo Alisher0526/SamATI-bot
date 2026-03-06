@@ -1,629 +1,464 @@
 import os
 import logging
-from datetime import datetime
+from pathlib import Path
+from aiohttp import web
 
-import aiosqlite
-from dotenv import load_dotenv
-
-from aiogram import Bot, Dispatcher, Router, F
-from aiogram.filters import CommandStart, Command
+from aiogram import Bot, Dispatcher, F
+from aiogram.enums import ParseMode
+from aiogram.client.default import DefaultBotProperties
 from aiogram.types import (
     Message,
     CallbackQuery,
-    ReplyKeyboardMarkup,
-    KeyboardButton,
-    ReplyKeyboardRemove,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    FSInputFile,
 )
-from aiogram.utils.keyboard import InlineKeyboardBuilder
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import StatesGroup, State
+from aiogram.filters import Command
+from aiogram.fsm.storage.memory import MemoryStorage
 
-load_dotenv()
+# =========================
+# SOZLAMALAR
+# =========================
+BOT_TOKEN = os.getenv("BOT_TOKEN", "TOKENINGIZNI_BU_YERGA_QOYING")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "123456789"))
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-ADMIN_IDS = {
-    int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",")
-    if x.strip().isdigit()
+WEBHOOK_PATH = "/webhook"
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "supersecret")
+WEBHOOK_URL = f"{RENDER_EXTERNAL_URL}{WEBHOOK_PATH}" if RENDER_EXTERNAL_URL else ""
+
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
+PDF_DIR = DATA_DIR / "pdfs"
+
+DATA_DIR.mkdir(exist_ok=True)
+PDF_DIR.mkdir(exist_ok=True)
+
+logging.basicConfig(level=logging.INFO)
+
+bot = Bot(
+    token=BOT_TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+)
+dp = Dispatcher(storage=MemoryStorage())
+
+# =========================
+# MA'LUMOTLAR
+# =========================
+# Fakultetlar va guruhlar
+FACULTIES = {
+    "iqtisod": {
+        "name": "Iqtisod fakulteti",
+        "groups": ["0124", "0224", "0324"]
+    },
+    "agronomiya": {
+        "name": "Agronomiya fakulteti",
+        "groups": ["A-11", "A-12", "A-13"]
+    },
+    "zootexniya": {
+        "name": "Zootexniya fakulteti",
+        "groups": ["Z-11", "Z-12"]
+    },
+    "vet": {
+        "name": "Veterinariya fakulteti",
+        "groups": ["V-11", "V-12"]
+    }
 }
-DB_NAME = "bot.db"
 
-if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN topilmadi")
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
-)
-
-router = Router()
+# Admin qaysi guruhga pdf yuklamoqchi ekanini vaqtincha saqlash
+admin_upload_state = {
+    "waiting_group": None
+}
 
 
 # =========================
-# DATABASE
+# KLAVIATURALAR
 # =========================
-class Database:
-    def __init__(self, db_name: str):
-        self.db_name = db_name
-
-    async def init(self):
-        async with aiosqlite.connect(self.db_name) as db:
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS users (
-                    user_id INTEGER PRIMARY KEY,
-                    full_name TEXT,
-                    username TEXT,
-                    created_at TEXT
-                )
-            """)
-
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS faculties (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    name TEXT UNIQUE NOT NULL,
-                    created_at TEXT
-                )
-            """)
-
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS groups_table (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    faculty_id INTEGER NOT NULL,
-                    name TEXT NOT NULL,
-                    pdf_file_id TEXT,
-                    created_at TEXT,
-                    updated_at TEXT,
-                    UNIQUE(faculty_id, name),
-                    FOREIGN KEY (faculty_id) REFERENCES faculties(id)
-                )
-            """)
-
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS settings (
-                    key TEXT PRIMARY KEY,
-                    value TEXT
-                )
-            """)
-
-            await db.commit()
-
-    async def add_user(self, user_id: int, full_name: str, username: str | None):
-        async with aiosqlite.connect(self.db_name) as db:
-            await db.execute("""
-                INSERT OR IGNORE INTO users (user_id, full_name, username, created_at)
-                VALUES (?, ?, ?, ?)
-            """, (user_id, full_name, username or "", datetime.now().isoformat()))
-            await db.commit()
-
-    async def get_user_count(self) -> int:
-        async with aiosqlite.connect(self.db_name) as db:
-            cur = await db.execute("SELECT COUNT(*) FROM users")
-            row = await cur.fetchone()
-            return row[0] if row else 0
-
-    async def get_all_users(self) -> list[int]:
-        async with aiosqlite.connect(self.db_name) as db:
-            cur = await db.execute("SELECT user_id FROM users")
-            rows = await cur.fetchall()
-            return [row[0] for row in rows]
-
-    async def add_faculty(self, name: str) -> bool:
-        try:
-            async with aiosqlite.connect(self.db_name) as db:
-                await db.execute("""
-                    INSERT INTO faculties (name, created_at)
-                    VALUES (?, ?)
-                """, (name.strip(), datetime.now().isoformat()))
-                await db.commit()
-            return True
-        except Exception:
-            return False
-
-    async def get_faculties(self):
-        async with aiosqlite.connect(self.db_name) as db:
-            cur = await db.execute("""
-                SELECT id, name FROM faculties ORDER BY name ASC
-            """)
-            return await cur.fetchall()
-
-    async def get_faculty(self, faculty_id: int):
-        async with aiosqlite.connect(self.db_name) as db:
-            cur = await db.execute("""
-                SELECT id, name FROM faculties WHERE id=?
-            """, (faculty_id,))
-            return await cur.fetchone()
-
-    async def add_group(self, faculty_id: int, name: str) -> bool:
-        try:
-            async with aiosqlite.connect(self.db_name) as db:
-                await db.execute("""
-                    INSERT INTO groups_table (faculty_id, name, created_at, updated_at)
-                    VALUES (?, ?, ?, ?)
-                """, (
-                    faculty_id,
-                    name.strip(),
-                    datetime.now().isoformat(),
-                    datetime.now().isoformat()
-                ))
-                await db.commit()
-            return True
-        except Exception:
-            return False
-
-    async def get_groups_by_faculty(self, faculty_id: int):
-        async with aiosqlite.connect(self.db_name) as db:
-            cur = await db.execute("""
-                SELECT id, name, pdf_file_id
-                FROM groups_table
-                WHERE faculty_id=?
-                ORDER BY name ASC
-            """, (faculty_id,))
-            return await cur.fetchall()
-
-    async def get_group(self, group_id: int):
-        async with aiosqlite.connect(self.db_name) as db:
-            cur = await db.execute("""
-                SELECT id, faculty_id, name, pdf_file_id
-                FROM groups_table
-                WHERE id=?
-            """, (group_id,))
-            return await cur.fetchone()
-
-    async def set_group_pdf(self, group_id: int, file_id: str):
-        async with aiosqlite.connect(self.db_name) as db:
-            await db.execute("""
-                UPDATE groups_table
-                SET pdf_file_id=?, updated_at=?
-                WHERE id=?
-            """, (file_id, datetime.now().isoformat(), group_id))
-            await db.commit()
-
-    async def delete_group(self, group_id: int):
-        async with aiosqlite.connect(self.db_name) as db:
-            await db.execute("DELETE FROM groups_table WHERE id=?", (group_id,))
-            await db.commit()
-
-    async def delete_faculty(self, faculty_id: int):
-        async with aiosqlite.connect(self.db_name) as db:
-            await db.execute("DELETE FROM groups_table WHERE faculty_id=?", (faculty_id,))
-            await db.execute("DELETE FROM faculties WHERE id=?", (faculty_id,))
-            await db.commit()
-
-    async def set_setting(self, key: str, value: str):
-        async with aiosqlite.connect(self.db_name) as db:
-            await db.execute("""
-                INSERT INTO settings (key, value)
-                VALUES (?, ?)
-                ON CONFLICT(key) DO UPDATE SET value=excluded.value
-            """, (key, value))
-            await db.commit()
-
-    async def get_setting(self, key: str):
-        async with aiosqlite.connect(self.db_name) as db:
-            cur = await db.execute("SELECT value FROM settings WHERE key=?", (key,))
-            row = await cur.fetchone()
-            return row[0] if row else None
+def main_menu():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📚 Fakultetlar", callback_data="faculties")],
+            [InlineKeyboardButton(text="ℹ️ Yordam", callback_data="help_info")],
+        ]
+    )
 
 
-db = Database(DB_NAME)
+def admin_menu():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📤 PDF yuklash", callback_data="admin_upload")],
+            [InlineKeyboardButton(text="📂 Yuklangan fayllar", callback_data="admin_files")],
+        ]
+    )
+
+
+def faculties_kb():
+    rows = []
+    for fac_key, fac_data in FACULTIES.items():
+        rows.append([
+            InlineKeyboardButton(
+                text=fac_data["name"],
+                callback_data=f"faculty:{fac_key}"
+            )
+        ])
+    rows.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data="back_main")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def groups_kb(faculty_key: str):
+    rows = []
+    groups = FACULTIES[faculty_key]["groups"]
+    for group in groups:
+        rows.append([
+            InlineKeyboardButton(
+                text=group,
+                callback_data=f"group:{faculty_key}:{group}"
+            )
+        ])
+    rows.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data="faculties")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def admin_faculties_kb():
+    rows = []
+    for fac_key, fac_data in FACULTIES.items():
+        rows.append([
+            InlineKeyboardButton(
+                text=fac_data["name"],
+                callback_data=f"admin_faculty:{fac_key}"
+            )
+        ])
+    rows.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data="admin_back")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def admin_groups_kb(faculty_key: str):
+    rows = []
+    groups = FACULTIES[faculty_key]["groups"]
+    for group in groups:
+        rows.append([
+            InlineKeyboardButton(
+                text=group,
+                callback_data=f"admin_group:{faculty_key}:{group}"
+            )
+        ])
+    rows.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data="admin_upload")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 # =========================
-# STATES
+# YORDAMCHI FUNKSIYALAR
 # =========================
-class AdminStates(StatesGroup):
-    waiting_faculty_name = State()
-    waiting_group_faculty = State()
-    waiting_group_name = State()
-    waiting_pdf_group = State()
-    waiting_pdf_file = State()
-    waiting_delete_faculty = State()
-    waiting_delete_group = State()
-    waiting_broadcast_text = State()
+def get_pdf_path(faculty_key: str, group: str) -> Path:
+    safe_group = group.replace("/", "_").replace("\\", "_").replace(" ", "_")
+    return PDF_DIR / f"{faculty_key}_{safe_group}.pdf"
 
 
-# =========================
-# HELPERS
-# =========================
 def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
+    return user_id == ADMIN_ID
 
 
-def main_menu(admin: bool = False):
-    buttons = [
-        [KeyboardButton(text="📚 Fakultetlar")],
-        [KeyboardButton(text="ℹ️ Yordam")],
-    ]
-    if admin:
-        buttons.append([KeyboardButton(text="🔐 Admin panel")])
-
-    return ReplyKeyboardMarkup(
-        keyboard=buttons,
-        resize_keyboard=True
-    )
-
-
-async def send_main_menu(message: Message):
-    await message.answer(
-        "Kerakli bo‘limni tanlang:",
-        reply_markup=main_menu(is_admin(message.from_user.id))
-    )
-
-
-def faculties_kb(faculties):
-    kb = InlineKeyboardBuilder()
-    for faculty_id, name in faculties:
-        kb.button(text=name, callback_data=f"faculty:{faculty_id}")
-    kb.adjust(1)
-    return kb.as_markup()
-
-
-def groups_kb(groups):
-    kb = InlineKeyboardBuilder()
-    for group_id, name, _ in groups:
-        kb.button(text=name, callback_data=f"group:{group_id}")
-    kb.button(text="⬅️ Orqaga", callback_data="back:faculties")
-    kb.adjust(1)
-    return kb.as_markup()
-
-
-def admin_panel_kb():
-    kb = InlineKeyboardBuilder()
-    kb.button(text="➕ Fakultet qo‘shish", callback_data="admin:add_faculty")
-    kb.button(text="➕ Guruh qo‘shish", callback_data="admin:add_group")
-    kb.button(text="📄 PDF yuklash", callback_data="admin:upload_pdf")
-    kb.button(text="📢 E'lon yuborish", callback_data="admin:broadcast")
-    kb.button(text="👥 Userlar soni", callback_data="admin:user_count")
-    kb.button(text="🗑 Fakultet o‘chirish", callback_data="admin:delete_faculty")
-    kb.button(text="🗑 Guruh o‘chirish", callback_data="admin:delete_group")
-    kb.button(text="🏠 Bosh menyu", callback_data="admin:home")
-    kb.adjust(1)
-    return kb.as_markup()
-
-
-def faculty_choose_admin_kb(faculties, action_prefix: str):
-    kb = InlineKeyboardBuilder()
-    for faculty_id, name in faculties:
-        kb.button(text=name, callback_data=f"{action_prefix}:{faculty_id}")
-    kb.button(text="❌ Bekor qilish", callback_data="admin:cancel")
-    kb.adjust(1)
-    return kb.as_markup()
-
-
-def groups_choose_admin_kb(groups, action_prefix: str):
-    kb = InlineKeyboardBuilder()
-    for group_id, name, _ in groups:
-        kb.button(text=name, callback_data=f"{action_prefix}:{group_id}")
-    kb.button(text="❌ Bekor qilish", callback_data="admin:cancel")
-    kb.adjust(1)
-    return kb.as_markup()
+def uploaded_files_text() -> str:
+    files = list(PDF_DIR.glob("*.pdf"))
+    if not files:
+        return "📂 Hozircha hech qanday PDF yuklanmagan."
+    text = "📂 Yuklangan fayllar:\n\n"
+    for f in files:
+        text += f"• {f.name}\n"
+    return text
 
 
 # =========================
-# USER
+# BUYRUQLAR
 # =========================
-@router.message(CommandStart())
+@dp.message(Command("start"))
 async def start_handler(message: Message):
-    await db.add_user(
-        user_id=message.from_user.id,
-        full_name=message.from_user.full_name,
-        username=message.from_user.username
-    )
-
     text = (
-        "Assalomu alaykum.\n\n"
-        "Bu bot orqali fakultet va guruh bo‘yicha jadval PDF’larini olasiz.\n"
-        "Kerakli bo‘limni tanlang."
+        "Assalomu alaykum!\n\n"
+        "Bu bot orqali dars jadvali PDF fayllarini olishingiz mumkin.\n\n"
+        "Kerakli bo‘limni tanlang:"
     )
-    await message.answer(
-        text,
-        reply_markup=main_menu(is_admin(message.from_user.id))
-    )
+    await message.answer(text, reply_markup=main_menu())
+
+    if is_admin(message.from_user.id):
+        await message.answer("🔐 Siz adminsiz.", reply_markup=admin_menu())
 
 
-@router.message(F.text == "ℹ️ Yordam")
+@dp.message(Command("admin"))
+async def admin_handler(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ Siz admin emassiz.")
+        return
+    await message.answer("Admin panelga xush kelibsiz:", reply_markup=admin_menu())
+
+
+@dp.message(Command("help"))
 async def help_handler(message: Message):
     await message.answer(
-        "Foydalanish tartibi:\n"
-        "1) 📚 Fakultetlar ni bosing\n"
-        "2) Fakultet tanlang\n"
-        "3) Guruh tanlang\n"
-        "4) PDF bo‘lsa bot yuboradi\n\n"
-        "Agar siz admin bo‘lsangiz, 🔐 Admin panel ham ko‘rinadi."
+        "📌 Foydalanish:\n"
+        "1. Fakultetni tanlang\n"
+        "2. Guruhni tanlang\n"
+        "3. PDF jadvalni oling\n\n"
+        "Admin uchun: /admin"
     )
 
 
-@router.message(F.text == "📚 Fakultetlar")
-async def faculties_handler(message: Message):
-    faculties = await db.get_faculties()
-    if not faculties:
-        await message.answer("Hozircha fakultetlar kiritilmagan.")
-        return
-
-    await message.answer(
-        "Fakultetni tanlang:",
-        reply_markup=faculties_kb(faculties)
+# =========================
+# CALLBACKLAR
+# =========================
+@dp.callback_query(F.data == "back_main")
+async def back_main_handler(callback: CallbackQuery):
+    await callback.message.edit_text(
+        "Asosiy menyu:",
+        reply_markup=main_menu()
     )
+    await callback.answer()
 
 
-@router.callback_query(F.data.startswith("faculty:"))
-async def faculty_callback(callback: CallbackQuery):
-    faculty_id = int(callback.data.split(":")[1])
-    faculty = await db.get_faculty(faculty_id)
-
-    if not faculty:
-        await callback.message.edit_text("Fakultet topilmadi.")
-        await callback.answer()
-        return
-
-    groups = await db.get_groups_by_faculty(faculty_id)
-    if not groups:
-        await callback.message.edit_text(
-            f"📚 {faculty[1]}\n\nHozircha guruhlar qo‘shilmagan."
+@dp.callback_query(F.data == "help_info")
+async def help_info_handler(callback: CallbackQuery):
+    await callback.message.edit_text(
+        "📌 Botdan foydalanish:\n\n"
+        "• Fakultetni tanlang\n"
+        "• Guruhni tanlang\n"
+        "• Agar PDF yuklangan bo‘lsa, bot sizga yuboradi\n\n"
+        "Admin uchun: /admin",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="⬅️ Orqaga", callback_data="back_main")]
+            ]
         )
-        await callback.answer()
-        return
-
-    await callback.message.edit_text(
-        f"📚 {faculty[1]}\n\nGuruhni tanlang:",
-        reply_markup=groups_kb(groups)
     )
     await callback.answer()
 
 
-@router.callback_query(F.data == "back:faculties")
-async def back_faculties(callback: CallbackQuery):
-    faculties = await db.get_faculties()
-    if not faculties:
-        await callback.message.edit_text("Hozircha fakultetlar kiritilmagan.")
-        await callback.answer()
-        return
-
+@dp.callback_query(F.data == "faculties")
+async def faculties_handler(callback: CallbackQuery):
     await callback.message.edit_text(
-        "Fakultetni tanlang:",
-        reply_markup=faculties_kb(faculties)
+        "📚 Fakultetni tanlang:",
+        reply_markup=faculties_kb()
     )
     await callback.answer()
 
 
-@router.callback_query(F.data.startswith("group:"))
-async def group_callback(callback: CallbackQuery):
-    group_id = int(callback.data.split(":")[1])
-    group = await db.get_group(group_id)
+@dp.callback_query(F.data.startswith("faculty:"))
+async def faculty_handler(callback: CallbackQuery):
+    faculty_key = callback.data.split(":")[1]
 
-    if not group:
-        await callback.message.answer("Guruh topilmadi.")
-        await callback.answer()
+    if faculty_key not in FACULTIES:
+        await callback.answer("Fakultet topilmadi", show_alert=True)
         return
 
-    _, faculty_id, group_name, pdf_file_id = group
-    faculty = await db.get_faculty(faculty_id)
-    faculty_name = faculty[1] if faculty else "Noma'lum fakultet"
+    await callback.message.edit_text(
+        f"🏛 {FACULTIES[faculty_key]['name']}\n\nGuruhni tanlang:",
+        reply_markup=groups_kb(faculty_key)
+    )
+    await callback.answer()
 
-    if not pdf_file_id:
+
+@dp.callback_query(F.data.startswith("group:"))
+async def group_handler(callback: CallbackQuery):
+    _, faculty_key, group = callback.data.split(":", 2)
+
+    pdf_path = get_pdf_path(faculty_key, group)
+
+    if not pdf_path.exists():
         await callback.message.answer(
-            f"📘 Fakultet: {faculty_name}\n"
-            f"👥 Guruh: {group_name}\n\n"
-            f"Hozircha bu guruh uchun PDF yuklanmagan."
+            f"❌ {group} guruhi uchun PDF hali yuklanmagan."
         )
         await callback.answer()
         return
 
     await callback.message.answer_document(
-        document=pdf_file_id,
-        caption=(
-            f"📘 Fakultet: {faculty_name}\n"
-            f"👥 Guruh: {group_name}"
+        document=FSInputFile(pdf_path),
+        caption=f"📄 {group} guruhi jadvali"
+    )
+    await callback.answer("PDF yuborildi")
+
+
+# =========================
+# ADMIN CALLBACKLAR
+# =========================
+@dp.callback_query(F.data == "admin_back")
+async def admin_back_handler(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Ruxsat yo‘q", show_alert=True)
+        return
+
+    await callback.message.edit_text(
+        "Admin panel:",
+        reply_markup=admin_menu()
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "admin_upload")
+async def admin_upload_handler(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Ruxsat yo‘q", show_alert=True)
+        return
+
+    await callback.message.edit_text(
+        "📤 PDF yuklash uchun fakultetni tanlang:",
+        reply_markup=admin_faculties_kb()
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("admin_faculty:"))
+async def admin_faculty_handler(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Ruxsat yo‘q", show_alert=True)
+        return
+
+    faculty_key = callback.data.split(":")[1]
+
+    await callback.message.edit_text(
+        f"🏛 {FACULTIES[faculty_key]['name']}\n\nQaysi guruhga PDF yuklaysiz?",
+        reply_markup=admin_groups_kb(faculty_key)
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("admin_group:"))
+async def admin_group_handler(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Ruxsat yo‘q", show_alert=True)
+        return
+
+    _, faculty_key, group = callback.data.split(":", 2)
+    admin_upload_state["waiting_group"] = {
+        "faculty_key": faculty_key,
+        "group": group
+    }
+
+    await callback.message.answer(
+        f"📥 Endi <b>{group}</b> guruhi uchun PDF fayl yuboring.\n"
+        f"Bot shu guruhga saqlab qo‘yadi."
+    )
+    await callback.answer("Endi PDF yuboring")
+
+
+@dp.callback_query(F.data == "admin_files")
+async def admin_files_handler(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Ruxsat yo‘q", show_alert=True)
+        return
+
+    await callback.message.answer(uploaded_files_text())
+    await callback.answer()
+
+
+# =========================
+# PDF QABUL QILISH
+# =========================
+@dp.message(F.document)
+async def document_handler(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ Sizga fayl yuklashga ruxsat yo‘q.")
+        return
+
+    current = admin_upload_state.get("waiting_group")
+    if not current:
+        await message.answer(
+            "Avval /admin orqali guruhni tanlang, keyin PDF yuboring."
         )
-    )
-    await callback.answer()
-
-
-# =========================
-# ADMIN
-# =========================
-@router.message(F.text == "🔐 Admin panel")
-async def admin_panel_open(message: Message):
-    if not is_admin(message.from_user.id):
-        await message.answer("Siz admin emassiz.")
-        return
-
-    await message.answer(
-        "Admin panel:",
-        reply_markup=admin_panel_kb()
-    )
-
-
-@router.message(Command("admin"))
-async def admin_command(message: Message):
-    if not is_admin(message.from_user.id):
-        await message.answer("Siz admin emassiz.")
-        return
-
-    await message.answer(
-        "Admin panel:",
-        reply_markup=admin_panel_kb()
-    )
-
-
-@router.callback_query(F.data == "admin:home")
-async def admin_home(callback: CallbackQuery, state: FSMContext):
-    await state.clear()
-    await callback.message.answer(
-        "Bosh menyuga qaytdingiz.",
-        reply_markup=main_menu(is_admin(callback.from_user.id))
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data == "admin:cancel")
-async def admin_cancel(callback: CallbackQuery, state: FSMContext):
-    await state.clear()
-    await callback.message.answer("Bekor qilindi.", reply_markup=admin_panel_kb())
-    await callback.answer()
-
-
-@router.callback_query(F.data == "admin:add_faculty")
-async def admin_add_faculty(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Ruxsat yo‘q", show_alert=True)
-        return
-
-    await state.set_state(AdminStates.waiting_faculty_name)
-    await callback.message.answer(
-        "Yangi fakultet nomini yuboring.\n\nMisol: Iqtisod"
-    )
-    await callback.answer()
-
-
-@router.message(AdminStates.waiting_faculty_name)
-async def save_faculty(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return
-
-    name = message.text.strip()
-    if len(name) < 2:
-        await message.answer("Fakultet nomi juda qisqa.")
-        return
-
-    ok = await db.add_faculty(name)
-    if ok:
-        await message.answer("✅ Fakultet qo‘shildi.", reply_markup=admin_panel_kb())
-    else:
-        await message.answer("⚠️ Fakultet mavjud yoki xatolik bo‘ldi.", reply_markup=admin_panel_kb())
-
-    await state.clear()
-
-
-@router.callback_query(F.data == "admin:add_group")
-async def admin_add_group(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Ruxsat yo‘q", show_alert=True)
-        return
-
-    faculties = await db.get_faculties()
-    if not faculties:
-        await callback.message.answer("Avval fakultet qo‘shing.")
-        await callback.answer()
-        return
-
-    await state.set_state(AdminStates.waiting_group_faculty)
-    await callback.message.answer(
-        "Qaysi fakultetga guruh qo‘shiladi?",
-        reply_markup=faculty_choose_admin_kb(faculties, "admin_group_faculty")
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("admin_group_faculty:"))
-async def choose_group_faculty(callback: CallbackQuery, state: FSMContext):
-    faculty_id = int(callback.data.split(":")[1])
-    await state.update_data(faculty_id=faculty_id)
-    await state.set_state(AdminStates.waiting_group_name)
-    await callback.message.answer("Endi guruh nomini yuboring.\n\nMisol: 0124")
-    await callback.answer()
-
-
-@router.message(AdminStates.waiting_group_name)
-async def save_group(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return
-
-    data = await state.get_data()
-    faculty_id = data.get("faculty_id")
-    name = message.text.strip()
-
-    if not faculty_id:
-        await message.answer("Xatolik: fakultet tanlanmagan.")
-        await state.clear()
-        return
-
-    if len(name) < 1:
-        await message.answer("Guruh nomi noto‘g‘ri.")
-        return
-
-    ok = await db.add_group(faculty_id, name)
-    if ok:
-        await message.answer("✅ Guruh qo‘shildi.", reply_markup=admin_panel_kb())
-    else:
-        await message.answer("⚠️ Guruh mavjud yoki xatolik bo‘ldi.", reply_markup=admin_panel_kb())
-
-    await state.clear()
-
-
-@router.callback_query(F.data == "admin:upload_pdf")
-async def admin_upload_pdf(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Ruxsat yo‘q", show_alert=True)
-        return
-
-    faculties = await db.get_faculties()
-    if not faculties:
-        await callback.message.answer("Avval fakultet va guruh qo‘shing.")
-        await callback.answer()
-        return
-
-    await callback.message.answer(
-        "PDF yuklash uchun avval fakultetni tanlang:",
-        reply_markup=faculty_choose_admin_kb(faculties, "admin_pdf_faculty")
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("admin_pdf_faculty:"))
-async def admin_pdf_faculty(callback: CallbackQuery, state: FSMContext):
-    faculty_id = int(callback.data.split(":")[1])
-    groups = await db.get_groups_by_faculty(faculty_id)
-
-    if not groups:
-        await callback.message.answer("Bu fakultetda guruhlar yo‘q.")
-        await callback.answer()
-        return
-
-    await callback.message.answer(
-        "PDF biriktiriladigan guruhni tanlang:",
-        reply_markup=groups_choose_admin_kb(groups, "admin_pdf_group")
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("admin_pdf_group:"))
-async def admin_pdf_group(callback: CallbackQuery, state: FSMContext):
-    group_id = int(callback.data.split(":")[1])
-    await state.update_data(group_id=group_id)
-    await state.set_state(AdminStates.waiting_pdf_file)
-    await callback.message.answer(
-        "Endi PDF faylni yuboring.\nFaqat document sifatida yuboring."
-    )
-    await callback.answer()
-
-
-@router.message(AdminStates.waiting_pdf_file, F.document)
-async def save_pdf_file(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return
-
-    data = await state.get_data()
-    group_id = data.get("group_id")
-
-    if not group_id:
-        await message.answer("Xatolik: guruh topilmadi.")
-        await state.clear()
         return
 
     document = message.document
+
     if not document.file_name.lower().endswith(".pdf"):
-        await message.answer("Iltimos, PDF fayl yuboring.")
+        await message.answer("❌ Faqat PDF fayl yuboring.")
         return
 
-    await db.set_group_pdf(group_id, document.file_id)
-    await message.answer("✅ PDF saqlandi.", reply_markup=admin_panel_kb())
-    await state.clear()
+    faculty_key = current["faculty_key"]
+    group = current["group"]
+    save_path = get_pdf_path(faculty_key, group)
+
+    await bot.download(document, destination=save_path)
+
+    admin_upload_state["waiting_group"] = None
+
+    await message.answer(
+        f"✅ PDF saqlandi!\n\n"
+        f"Fakultet: {FACULTIES[faculty_key]['name']}\n"
+        f"Guruh: {group}\n"
+        f"Fayl: {save_path.name}"
+    )
 
 
-@router.message(AdminStates.waiting_pdf_file)
-async def wrong_pdf_type(message: Message):
-    await message.answer("Iltimos, PDF faylni document qilib yuboring.")
+# =========================
+# ODDIY XABARLAR
+# =========================
+@dp.message()
+async def all_messages_handler(message: Message):
+    text = message.text.lower().strip() if message.text else ""
+
+    if text in ["salom", "assalomu alaykum", "start"]:
+        await message.answer(
+            "Assalomu alaykum!\nKerakli bo‘limni tanlang:",
+            reply_markup=main_menu()
+        )
+        return
+
+    await message.answer(
+        "Buyruqni tushunmadim.\n/start ni bosing.",
+        reply_markup=main_menu()
+    )
 
 
-@router.callback_query(F.data == "admin:user_count")
-async def admin_u
+# =========================
+# WEBHOOK + AIOHTTP
+# =========================
+async def on_startup(app: web.Application):
+    if not BOT_TOKEN or BOT_TOKEN == "TOKENINGIZNI_BU_YERGA_QOYING":
+        raise RuntimeError("BOT_TOKEN noto‘g‘ri yoki kiritilmagan.")
+
+    if WEBHOOK_URL:
+        await bot.set_webhook(
+            url=WEBHOOK_URL,
+            secret_token=WEBHOOK_SECRET,
+            drop_pending_updates=True
+        )
+        logging.info(f"Webhook o‘rnatildi: {WEBHOOK_URL}")
+    else:
+        logging.warning("RENDER_EXTERNAL_URL topilmadi. Webhook o‘rnatilmadi.")
+
+
+async def on_shutdown(app: web.Application):
+    await bot.delete_webhook(drop_pending_updates=False)
+    await bot.session.close()
+    logging.info("Bot to‘xtadi.")
+
+
+async def health(request):
+    return web.Response(text="Bot is running!")
+
+
+async def webhook_handler(request):
+    secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
+    if secret != WEBHOOK_SECRET:
+        return web.Response(status=403, text="Forbidden")
+
+    data = await request.json()
+    update = dp.resolve_update_type(data)
+    telegram_update = dp.feed_webhook_update(bot=bot, update=data)
+    await telegram_update
+    return web.Response(text="ok")
+
+
+def main():
+    app = web.Application()
+
+    app.router.add_get("/", health)
+    app.router.add_post(WEBHOOK_PATH, webhook_handler)
+
+    app.on_startup.append(on_startup)
+    app.on_shutdown.append(on_shutdown)
+
+    port = int(os.getenv("PORT", 10000))
+    web.run_app(app, host="0.0.0.0", port=port)
+
+
+if __name__ == "__main__":
+    main()
