@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: samati-pro-bot
+    name: samati-bot
     runtime: python
     plan: free
     buildCommand: pip install -r requirements.txt
