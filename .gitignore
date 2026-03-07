@@ -1,4 +1,5 @@
-.env
 __pycache__/
 *.pyc
-bot.db
+*.db
+.env
+uploads/*
