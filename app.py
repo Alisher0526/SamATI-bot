@@ -579,4 +579,209 @@ def text_handler(message):
                     return
                 user_state[message.from_user.id] = {
                     "step": "delete_schedule_group",
+                    "faculty_id": faculty["id"],
+                    "faculty_name": faculty["name"]
+                }
+                bot.send_message(
+                    message.chat.id,
+                    f"<b>{faculty['name']}</b> uchun guruh nomini yuboring:",
+                    reply_markup=back_menu()
+                )
+                return
+
+            if step == "delete_schedule_group":
+                group = get_group_by_name_and_faculty(state["faculty_id"], text)
+                if not group:
+                    bot.send_message(message.chat.id, "Guruh topilmadi.", reply_markup=admin_menu())
+                    user_state.pop(message.from_user.id, None)
+                    return
+
+                cur.execute(
+                    "DELETE FROM schedules WHERE faculty_id=? AND group_id=?",
+                    (state["faculty_id"], group["id"])
+                )
+                conn.commit()
+
+                bot.send_message(
+                    message.chat.id,
+                    f"🗑 Jadval o'chirildi: <b>{state['faculty_name']} — {group['name']}</b>",
+                    reply_markup=admin_menu()
+                )
+                user_state.pop(message.from_user.id, None)
+                return
+
+            if step == "broadcast_text":
+                users = cur.execute("SELECT user_id FROM users").fetchall()
+                success = 0
+                failed = 0
+
+                for u in users:
+                    try:
+                        bot.send_message(u["user_id"], f"📢 <b>Admin xabari</b>\n\n{text}")
+                        success += 1
+                    except Exception:
+                        failed += 1
+
+                bot.send_message(
+                    message.chat.id,
+                    f"✅ Reklama tugadi.\n\nYuborildi: <b>{success}</b>\nXato: <b>{failed}</b>",
+                    reply_markup=admin_menu()
+                )
+                user_state.pop(message.from_user.id, None)
+                return
+
+    bot.send_message(
+        message.chat.id,
+        "Buyruq tanlang.",
+        reply_markup=main_menu(is_admin(message.from_user.id))
+    )
+
+# =========================
+# DOCUMENT UPLOAD
+# =========================
+@bot.message_handler(content_types=['document'])
+def document_handler(message):
+    add_user(message)
+
+    if not is_admin(message.from_user.id):
+        bot.reply_to(message, "Siz fayl yuklay olmaysiz.")
+        return
+
+    state = user_state.get(message.from_user.id)
+    if not state or state.get("step") != "upload_schedule_file":
+        bot.reply_to(message, "Hozir fayl qabul qilish rejimi yoqilmagan.")
+        return
+
+    doc = message.document
+
+    if not doc.file_name.lower().endswith(".pdf"):
+        bot.reply_to(message, "Faqat PDF yuboring.")
+        return
+
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO schedules(faculty_id, group_id, file_id, file_name, uploaded_at)
+        VALUES(?, ?, ?, ?, ?)
+        ON CONFLICT(faculty_id, group_id)
+        DO UPDATE SET
+            file_id=excluded.file_id,
+            file_name=excluded.file_name,
+            uploaded_at=excluded.uploaded_at
+    """, (
+        state["faculty_id"],
+        state["group_id"],
+        doc.file_id,
+        doc.file_name,
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    ))
+    conn.commit()
+
+    bot.send_message(
+        message.chat.id,
+        f"✅ Jadval saqlandi:\n<b>{state['faculty_name']} — {state['group_name']}</b>",
+        reply_markup=admin_menu()
+    )
+    user_state.pop(message.from_user.id, None)
+
+# =========================
+# CALLBACKS
+# =========================
+@bot.callback_query_handler(func=lambda call: True)
+def callback_handler(call):
+    try:
+        if call.data == "back_faculties":
+            bot.edit_message_text(
+                "Fakultetni tanlang:",
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=faculty_inline_keyboard()
+            )
+            return
+
+        if call.data.startswith("faculty_"):
+            faculty_id = int(call.data.split("_")[1])
+
+            bot.edit_message_text(
+                "Guruhni tanlang:",
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=groups_inline_keyboard(faculty_id)
+            )
+            return
+
+        if call.data.startswith("group_"):
+            _, faculty_id, group_id = call.data.split("_")
+            faculty_id = int(faculty_id)
+            group_id = int(group_id)
+
+            cur = conn.cursor()
+            faculty = cur.execute("SELECT * FROM faculties WHERE id=?", (faculty_id,)).fetchone()
+            group = cur.execute("SELECT * FROM groups_table WHERE id=?", (group_id,)).fetchone()
+            schedule = get_schedule(faculty_id, group_id)
+
+            if not faculty or not group:
+                bot.answer_callback_query(call.id, "Ma'lumot topilmadi.")
+                return
+
+            if not schedule:
+                bot.send_message(
+                    call.message.chat.id,
+                    f"❌ Hozircha jadval yuklanmagan.\n\n<b>{faculty['name']} — {group['name']}</b>",
+                    reply_markup=main_menu(is_admin(call.from_user.id))
+                )
+                bot.answer_callback_query(call.id, "Jadval topilmadi")
+                return
+
+            bot.send_document(
+                call.message.chat.id,
+                schedule["file_id"],
+                caption=f"📄 <b>{faculty['name']} — {group['name']}</b>\nYuklangan jadval"
+            )
+            bot.answer_callback_query(call.id, "Jadval yuborildi")
+            return
+
+    except Exception as e:
+        logger.exception("Callback xato: %s", e)
+        try:
+            bot.answer_callback_query(call.id, "Xatolik yuz berdi")
+        except Exception:
+            pass
+
+# =========================
+# FLASK ROUTES
+# =========================
+@app.route("/", methods=["GET"])
+def home():
+    return "SAMATI BOT ISHLAYAPTI", 200
+
+@app.route("/health", methods=["GET"])
+def health():
+    return {"ok": True, "service": "samati-bot"}, 200
+
+@app.route(f"/{BOT_TOKEN}", methods=["POST"])
+def telegram_webhook():
+    json_str = request.get_data().decode("utf-8")
+    update = telebot.types.Update.de_json(json_str)
+    bot.process_new_updates([update])
+    return "OK", 200
+
+# =========================
+# MAIN
+# =========================
+init_db()
+
+if __name__ == "__main__":
+    webhook_url = f"{RENDER_EXTERNAL_URL}/{BOT_TOKEN}" if RENDER_EXTERNAL_URL else None
+
+    try:
+        bot.remove_webhook()
+        if webhook_url:
+            bot.set_webhook(url=webhook_url)
+            logger.info("Webhook o'rnatildi: %s", webhook_url)
+        else:
+            logger.warning("RENDER_EXTERNAL_URL topilmadi. Renderda env avtomatik bo'lishi kerak.")
+    except Exception as e:
+        logger.exception("Webhook o'rnatishda xato: %s", e)
+
+    app.run(host="0.0.0.0", port=PORT)
   
