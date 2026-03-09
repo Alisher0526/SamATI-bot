@@ -1,8 +1,0 @@
-services:
-  - type: web
-    name: samati-pro-bot
-    runtime: python
-    plan: free
-    buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:flask_app
-    autoDeploy: true
