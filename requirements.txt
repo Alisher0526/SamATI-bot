@@ -1,6 +1,5 @@
-python-telegram-bot==21.10
-requests==2.32.3
-flask==3.0.3
-gunicorn==22.0.0
-asyncpg==0.29.0
-python-dotenv==1.0.1
+aiogram==3.22.0
+fastapi==0.116.1
+uvicorn[standard]==0.35.0
+asyncpg==0.30.0
+python-dotenv==1.1.1
